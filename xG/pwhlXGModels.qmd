@@ -1,0 +1,325 @@
+---
+title: "This is a short paper about PWHL expected goals."
+subtitle: "Utah HC Summer 2024 Analytics Challenge"
+author: "Evan Graham-Murray"
+format: pdf
+fontsize: 10pt
+geometry:
+      - top=20mm
+      - left=20mm
+      - right=20mm
+      - bottom=20mm
+execute: 
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(ggplot2)
+library(data.table)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+
+source("./plot_nhl_rink.R")
+
+teamColors <<- c(`MTL` = "#993300",
+							   `TOR` = "#1F78B4", 
+								 `NY`  = "#66FFFF", 
+							   `BOS` = "#33A02C", 
+							   `MIN` = "#6A3D9A",
+							   `OTT` = "#E31A1C"
+							  )
+```
+
+Expected goals (xG) have become a workhorse of analytics in hockey. I think there are several reasons for this, including that xG tends to be interpretable, superficially easy to define and explain, and serves as a robust and convenient metric on which to build win probability models.[^1] But you'll notice I said that xG is only "superficially easy to define and explain. In most websites and media spaces, you'll see a definition of xG that goes something like this:
+
+[^1]: xG is the basis for the much-memed [Deserve to Win O'Meter](https://moneypuck.com/about.htm#:~:text=goals%20above%20expected.-,Deserve%20To%20Win%20O%27Meter,-The%20%22Deserve%20To), as well as other modeling efforts like the now-defunct [FiveThirtyEight soccer model](https://fivethirtyeight.com/methodology/how-our-club-soccer-predictions-work/#:~:text=than%204%2D0.-,Forecasting%20matches,-Given%20two%20teams).
+
+> *Expected Goals is a measure of how many goals, on average, a team is expected to score over a large sample of games. Each shot has an xG value between 0 and 1. For example, a shot with 0.3 xG would be scored, on average, 30% of the time.*
+
+This is, on its surface, a fine definition. It tells readers what they need to know to interpret xG. When they see a headline like "Utah HC had 1.5 expected goals on Thursday night versus Colorado's 4.5", they know what it means. But an explanation of how to interpret something is not a true definition. What's missing is a more complete definition of what *expected* means. Put simply, expected goals are expected *according to what, and whom, exactly?*
+
+I think this "definition gap" contributes to polarization in the discussion around analytics in hockey. On the one hand, some fans and media take the interpretability of the definition and run with it, fully bought into xG as some hockey analytics equivalent of gravity.[^2] On the other hand, a second group intuit that something is missing in the definition, even if they don't know exactly what it is, and remain skeptical. Some even argue that xG doesn't really mean anything.[^3]
+
+[^2]: This is often the source of "X team will come back to earth soon!" arguments, in addition to PDO.
+
+[^3]: Googling the phrase "xG doesn't mean anything" [is particularly revealing](https://www.google.com/search?q=xG+doesn%27t+mean+anything).
+
+From here, we will further define and explore where the "expected" in expected goals comes from and what it means. In doing so, we will create and evaluate three separate xG models based on real data. Together, they will help not only to better define expected goals, but will also illustrate the value of using multiple models in data analysis.
+
+## Part 1: The data and the definition
+
+To celebrate the creation of the PWHL and help spotlight the women's game, I collected publicly available play-by-play data[^4] from every PWHL game this past season (including preseason and playoffs). The play-by-play data tracks every shot on goal but shot attempts are not tracked. It's a great dataset for this exercise because it is large enough to be useful for modeling, but small enough we don't have to worry about data storage or code running slowly.
+
+[^4]: An interactive example of the play-by-play data for a single game, Game 5 of the Walter Cup Final series, [can be found here](https://www.thepwhl.com/en/stats/game-center/98).
+
+```{r}
+#| label: load and process shots data
+
+shots = fread("./shots.csv")
+
+# project the old coordinates to the new ones
+# the zero point is the middle
+	# x=0,y=0 in our plot translates to x=300,y=150 in Flo units
+shots[,x := x - 300]
+shots[,y := y - 150]
+
+# an NHL rink is 200 x 85 feet, so the translation should be 300/100 for the x coordinate and 150/42.5 for the y
+xFactor = 100 / 300
+yFactor = 42.5 / 150
+shots[,x := x * xFactor]
+shots[,y := y * yFactor]
+
+shotsNotFlipped = copy(shots)
+
+# force to half a rink
+shots[x < 0, x := 0 - x]
+
+# add a dummy column to make merging later easy
+shots[,dummy := "dummy"]
+
+# create zones for the location-based xg model
+xBreak = 54
+yRight = -22
+yLeft = 22
+
+# neutral zone and behind the net grouped together
+shots[x < 25.5,xgZone := "neutral"]
+shots[x >= 89,xgZone := "behind"]
+# top of the zone (above the faceoff circles) is split into 3
+shots[is.na(xgZone) & x < xBreak & y <= yRight,xgZone := "top right"]
+shots[is.na(xgZone) & x < xBreak & y >= yLeft,xgZone := "top left"]
+shots[is.na(xgZone) & x < xBreak,xgZone := "top center"]
+# the rest of the zone is split
+shots[is.na(xgZone) & y <= yRight,xgZone := "righ twing"]
+shots[is.na(xgZone) & y >= yLeft,xgZone := "left wing"]
+shots[is.na(xgZone),xgZone := "center"]
+
+# group the positions
+shots[,groupPosition := "F"]
+shots[grepl("D", shooterPosition),groupPosition := "D"]
+shots[grepl("G", shooterPosition),groupPosition := "G"]
+```
+
+The first thing to do with new data is to plot it, which we do in Figure 1.[^5]
+
+[^5]: For the rest of this paper we will work with modifed data, in which I flipped the coordinates on one half of the rink so everything appears relative to the same goal. This makes things a bit easier to see and interpret without affecting the math we do down the line.
+
+
+```{r}
+#| fig-cap: "Our data"
+
+plot_nhl_rink("whole") +
+	geom_point(data=shotsNotFlipped, mapping=aes(x=x,y=y,color=shooterTeam), alpha=0.5, size=0.5) +
+	scale_color_manual(values=teamColors) +
+	labs(title="PWHL Shot Locations", color="Team") +
+	guides(colour = guide_legend(override.aes = list(size=3, alpha=1)))
+```
+
+Our sample consists of roughly 5500 shots. The play-by-play data contains a number of details for each shot, including the shooter, goaltender, shot location, shot type, and, of course, whether it was a goal. This is all we need to make a few different xG models, except we still lack a workable definition. The definition I shared earlier is incomplete, but nonetheless a good starting point. Specifically, consider the last sentence:
+
+> *For example, a shot with 0.3 xG would be scored, on average, 30% of the time.*
+
+How does an expected goal model comes to believe a shot has 0.3 xG? 
+
+The answer is surprisingly simple. I summarize it in 2 steps: *Categorize then Count*. First, xG models categorize shots from historical data into groups based on common characteristics they share.[^6] Then they count the number of shots in each group, the number of goals in each group, and divide the two. The result is an xG value for that category. 
+
+[^6]: These characteristics can range from simple and obvious, like shot type and location, to more complex and difficult to track, like "occurred after a cross-ice pass". Most xG models are limited because of the scope of data for each shot that is available, rather than anything to do with math or coding. 
+
+So, when an xG model says a shot has 0.3 xG, it's saying two things in its own, highly precise way. First, it grouped the shot in question with other historical shots based on some number of characteristics they all share in common. Second, 30% of those historical shots turned into goals. Therefore, the shot in question has 0.3 xG. 
+
+This definition is great because it's easy to understand and easy to put into practice. The best way to learn is by doing, so now we will create three different xG models for the PWHL. Afterwards we will see what we can learn from them about each team's underlying performance.
+
+## Part 2: Making models
+
+From our definition, we know that the math needed to make an xG model is easy once we choose how to categorize our shot data. For our first model, it makes sense to start with the simplest possible categorization. See if you can figure it out - what's the smallest possible number of categories needed to make a functional xG model?
+
+```{r}
+#| label: xg models
+
+simpleXG = shots[goalie != "Empty Net" & groupPosition != "G",
+								 .(xg1 = sum(isGoal) / .N, count1=.N), by=.(dummy)]
+
+intermediateXG = shots[goalie != "Empty Net" & groupPosition != "G",
+											 .(xg2 = sum(isGoal) / .N, count2=.N), by=.(shotType)]
+
+complexXG = shots[goalie != "Empty Net" & groupPosition != "G",
+									.(goals=sum(isGoal), count3=.N, isBackground=FALSE), by=.(xgZone,shotType)]
+
+# anything with a small sample or 0 goals should be set to our background xg value
+complexXG[goals < 2 | count3 < 20,isBackground := TRUE]
+backXGValue = as.numeric(complexXG[isBackground == TRUE,.(value = sum(goals) / sum(count3))])
+
+complexXG[,xg3 := goals / count3]
+complexXG[isBackground == TRUE,xg3 := backXGValue]
+```
+
+```{r}
+#| label: apply the xg models
+
+xgModels = merge(shots, simpleXG, by="dummy")
+xgModels = merge(xgModels, intermediateXG, by=c("shotType"))
+xgModels = merge(xgModels, complexXG[,.(xgZone,shotType,xg3,count3)], by=c("xgZone","shotType"))
+```
+
+Did you guess 1? 
+
+A single-category xG model makes a simple claim: a shot is a shot is a shot is a shot. The math is straightforward: our data sample consists of 5,444 shots and 419 goals.[^7] This calculates to a shooting percentage of 7.7%, so we assign each shot an xG value of 0.077. Needless to say, this is not a complicated model - in fact, let's name this model the *trivial model*. Figure 2 plots each shot in our sample colored by expected goals. Because the model is so simple, only one color present in the plot!
+
+[^7]: For all xG models and their evaluation, we are removing empty net shots and goals because they are not representative of the game overall.
+
+```{r}
+#| fig-cap: Trivial model xG by location
+#| fig-height: 3
+
+plot_nhl_rink("half") +
+	geom_point(data=xgModels, mapping=aes(x=x,y=y,color=xg1), alpha=0.5, size=0.5) +
+	scale_color_continuous(limits = c(0,0.14), type="viridis", breaks=c(0,0.077,0.14)) +
+	labs(title="PWHL xG by shot: trivial model", color="xG Value") +
+	theme(legend.position = "right")
+```
+
+For our second model, let's use some nontrivial groupings. Each shot in the PHWL data is coded with a shot type, including slap shots, wrist shots, snap shots, backhand shots, and tipped shots. Many shots aren't coded at all, using a fallback type called default. Intuitively, we may expect that certain shot types are more likely to result in goals than others, so it's reasonable to calculate xG on this basis. 
+
+Let's name this model the *shot type model*. Figure 3 shows xG value it calculates for each shot type. For reference, the horizontal dashed line represents the trivial model's xG value.
+
+::: {layout="[[50,50]]"}
+
+```{r}
+#| fig-cap: Shot type model's xG values
+
+ggplot(intermediateXG, aes(x=shotType, y=xg2)) +
+	geom_bar(stat="identity", fill="#69B3E7", color="black") +
+	geom_hline(yintercept=0.077, color="black", linetype="dashed") +
+	theme_bw() + labs(title="PWHL xG by shot type", x="Shot Type", y="xG Value")
+```
+
+<div>
+
+> In Figure 3, we can see that tipped shots are the most dangerous while slap shots have the lowest xG value. This demonstrates the value that adding more dimensions to an xG model can have. Intuitively, we expect teams that are better at tipping shots to score more goals, so it's nice to have an xG model that reflects that.
+
+</div>
+
+:::
+
+Why do slap shots have the lowest xG value? The most common explanation is that they tend to be taken fartherß from the net, demanding more accuracy from shooters while giving goaltenders more time to see the puck and make a save. This brings us to the dimension we will add to our third xG model: shot location. 
+
+Every shot in our PWHL dataset has an x and y coordinate. These are both continuous variables, unlike shot type, which means we need to categorize the shots into location-based groups. This is called *discretizing* the data.[^8] We will discretize the location data by creating 8 areas. The first two have the smallest samples - anything outside the offensive zone and anything from behind the goal line. The next six encompass the bulk of the offensive zone and split it into three vertical columns (left, right, and center) and two horizontal rows (one closer and one farther away). The 8 areas are shown in Figure 4.
+
+[^8]: It's worth (foot)noting here that there is no standard way to discretize continuous data like shot location. Properly discretizing data requires balancing the need for having a granular model while also needing a large enough sample in each bin to be statistically meaningful. I landed on having 8 discrete bins, but most real-world xG models have more becuase they have more data.
+
+Our final model, the *shot type + location* model, has 42 shot categories. Each one is a combination of shot type and area. Because we don't have much data, we run into some sample size issues that we should clean up. This is where individual experience and expertise factors into model design. The first issue is that some groups don't have any goals, and having a whole bunch of 0 xg value shots doesn't match up with our expectation that every shot should have *some* chance of going in. The second issue is that, even when some groups have goals, they don't have many recorded shots so the xG value that's calculated isn't realistic. To solve both issues, we can combine every group which has either (a) fewer than 2 goals scored, or (b) fewer than 20 shots recorded, into a single meta-group which we call the *background xG*. 
+
+Figure 4 plots each shot in our sample, colored by xG according to the shot type + location model.  
+
+```{r}
+#| fig-cap: "Shot location zones and xG values for the shot type + location model"
+#| fig-width: 12
+
+zoneCoords = data.table(
+	xmin = c(0, 89, rep(c(54, 25.5), 3)),
+	xmax = c(25.5, 100, rep(c(89, 54), 3)),
+	ymin = c(rep(-42.5, 2), rep(22, 2), rep(-42.4, 2), rep(-22, 2)),
+	ymax = c(rep(42.5, 4), rep(22, 4)),
+	name = c("neutral","behind","left wing","top left","right wing","top right","center","top middle")
+) 
+zoneCoords[,name := factor(name, levels=zoneCoords$name)]
+
+areaColors = c("neutral" = "#CAB2D6",
+							 "behind" = "#6A3D9A",
+							 "right wing" = "#A6CEE3",
+							 "top right" = "#1F78B4",
+							 "left wing" = "#B2DF8A",
+							 "top left" = "#33A02C",
+							 "center" = "#FB9A99",
+							 "top middle" = "#E31A1C"
+)
+
+p1 = plot_nhl_rink("half") +
+	geom_rect(data=zoneCoords, aes(xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, fill=name), alpha=0.5) +
+	scale_fill_manual(values=areaColors) +
+	labs(title="Discrete xG areas", fill=NULL) +
+	theme(legend.position = "bottom")
+
+p2 = plot_nhl_rink("half") +
+	geom_point(data=xgModels, mapping=aes(x=x,y=y,color=xg3), alpha=0.5, size=0.5) +
+	scale_color_continuous(limits = c(0,0.14), type="viridis", breaks=c(0,0.077,0.14)) +
+	labs(title="PWHL xG by shot", color="xG Value") +
+	theme(legend.position = "bottom")
+
+p1 + p2
+```
+
+In Figure 4, we notice more colors of xG values are more evenly spread out across the offensive zone. However, the center of the ice, well-known to be the most dangerous area overall, lights up for most shot types. Some dark points of low xG remain - this is the background xG.[^9] Snap shots and tipped shots from the center of the offensive zone have xG values above 0.12, more than six times greater than the background xG. 
+
+[^9]: Specifically, we have a very small sample size for slap shots from this part of the ice. To avoid artifacts, we fall back on the background xG as discussed earlier.
+
+## Part 3: Evaluating the Models
+
+Now that we have three models, the time has come for evaluation. For each model, we can calculate each team's xG for and against by adding up the xG values of each shot, for and against.[^10] Table 1 presents the results for all three models, including xG share as a percentage, with their actual number of goals for and against for reference.
+
+[^10]: Because our sample includes the preseason and postseason, some teams have played more games than others. 
+
+```{r}
+xgFor = xgModels[goalie != "Empty Net" & groupPosition != "G",
+								 .(xgFor1=sum(xg1), xgFor2=sum(xg2), xgFor3=sum(xg3), goalsFor=sum(isGoal)), by=.(shooterTeam)]
+xgOpp = xgModels[goalie != "Empty Net" & groupPosition != "G",
+								 .(xgOpp1=sum(xg1), xgOpp2=sum(xg2), xgOpp3=sum(xg3), goalsOpp=sum(isGoal)), by=.(goalieTeam)]
+
+xgByTeam = merge(xgFor, xgOpp, by.x="shooterTeam", by.y="goalieTeam")
+setnames(xgByTeam, old="shooterTeam", new="team")
+
+xgByTeam[,xgShare1 := paste( format(round(xgFor1 / (xgFor1 + xgOpp1) * 100, 1), nsmall=1), "%", sep="")]
+xgByTeam[,xgShare2 := paste( format(round(xgFor2 / (xgFor2 + xgOpp2) * 100, 1), nsmall=1), "%", sep="")]
+xgByTeam[,xgShare3 := paste( format(round(xgFor3 / (xgFor3 + xgOpp3) * 100, 1), nsmall=1), "%", sep="")]
+
+xgByTeam = xgByTeam[order(xgByTeam$xgShare3, decreasing=TRUE),]
+
+kable(xgByTeam[,.(team, goalsFor,goalsOpp, xgFor1,xgOpp1,xgShare1, xgFor2,xgOpp2,xgShare2, xgFor3,xgOpp3,xgShare3)], 
+			digits=2, booktabs=TRUE, linesep="", caption="PWHL team evaluation across three xG models",
+			col.names=c("Team","For","Against", rep(c("For","Against","Share"), 3))) %>%
+	add_header_above(c(" "=1, "Actual Goals"=2, "Trivial Model xG"=3, "Shot Type xG"=3, "Shot Type + Location xG"=3)) %>%
+	kable_styling(latex_options = c("striped","scale_down","hold_position")) %>%
+	column_spec(c(1,3,6,9), border_right=TRUE)
+```
+
+Broadly, the three models tell the same story. They rank the 6 PWHL teams identically in terms of xG share. Specifically, all three models agree that, despite their end-of-season losing streak, PWHL Minnesota was the best team in the league and therefore a deserving champion. They also agree that PHWL Toronto's offense vastly exceeded their xG performance while PHWL Ottawa's underlying numbers were much stronger than their placement in the standings suggested, mostly because their goals against rate was much higher than their xG against. 
+
+If we look closer, there are some things we can learn by comparing some team's performances across models. Notably, as we shift focus from the trivial model to the shot type + location model, we see that PWHL Montreal's offense looks worse (lower xG for), PWHL Minnesota's defense looks better (lower xG against), and PWHL Toronto's overall xG share increases.
+
+When evaluating differences between models, it's best to think about what they value based on their categorization of shots. The trivial model values all shots equally or, in other words, values shot volume more than shot quality. The shot type + location model, on the other hand, is much more concerned with shot quality. The fact that PWHL Montreal's offensive output drops from the trivial model to the shot type + location model suggests they relied on shot volume and elite finishing talent to produce goals from less dangerous areas of the ice.[^11] Likewise, PWHL Minnesota's defensive structure appears to be the best at preventing shots from dangerous areas of the ice. PWHL Toronto's offense has the opposite trend of Montreal's, suggesting they were the most efficient team in the league at getting high-quality looks from dangerous areas of the ice.
+
+[^11]: This is not an unreasonable strategy when your offense is led by Laura Stacey and Marie-Philip Poulin (hockey's favorite power couple), who have no shortage of finishing ability. Laura Stacey, in particular, has a more dangerous slap shot than the xG models show in Figure 3 and Figure 4.
+
+These are just some examples of the things we can learn by examining a team's performance across several xG models, even though every model follows the same *Categorize then Count* framework.
+
+## Part 4: What it all means
+
+As we approach the end of this paper, we've learned about how expected goals are defined in practical terms, used this knowledge to create three different PWHL xG models, and used them to evaluate each PHWL team and glimpse under the hood to see why some teams appear stronger in some models and weaker in others.
+
+Expected goal models, like the humand who code them, have values and preferences baked into their creation. We can only glean this more detailed information related to play style and systems by comparing each team's performance across multiple models. Despite how they are sometimes portrayed, xG models are not objective indicators of a team's underlying performance (or whether it deserves to win), but a quantitative reflection of a team's performance according to the factors they value. 
+
+This is not a weakness or drawback of xG models but a strength. By evaluating team performances across several models, we can arrive at more a nuanced and complete understanding of the game. From this, we learn one more important lesson: 
+
+> *Any analytics department which relies on one model or approach for evaluating the game, even if it's for evaluating a single metric like xG, will be subject to blind spots and more likely to fail in their mission.*
+
+Diversity wins. Put this into practice!
+
+___
+
+# Postscript
+
+If you got this far, thank you for reading my submission! I don't think it's particuarly new or groundbreaking, but I had fun putting it together and I hope you had fun reading it. 
+
+Whether you decide to interview me or not, I would like to end by extending the wisdom of the ending conclusion of this paper into some recommendations to Utah HC in your approach to evaluating the Summer Analytics Challenge. I currently work on a very technical mathematical modeling and data analysis team and I can say from expereince that these recommendations have served us very well in our interviewing, hiring, and onboarding process.
+
+1. If you have the resources to do so, hire more than one intern from very different backgrounds. Have them collaborate.
+
+2. If you come across a submission that runs counter to your intuition and experience, but cannot find an obvious mathematical or logical error in its analysis, interview that candidate. They may very well value something in the game that is new to you. Walk into the interview expecting to be surprised by what you learn.
+
+3. Any submitter who openly acknowledges underlying assumptions and uncertainties in their work, includes contrary points or data, or otherwise presents evidence and data without overstating confidence will likely be a good candidate when it comes to intperpreting analytics in a way that is nuanced and the most useful for the hockey operations department as a whole. 
+
