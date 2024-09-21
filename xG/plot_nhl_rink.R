@@ -2,9 +2,13 @@ library(ggplot2)
 library(ggforce)
 
 # this code largely taken from: https://github.com/mrbilltran/the-win-column/blob/master/nhl_rink_plot.R
-plot_nhl_rink <- function(size) {
+plot_nhl_rink <- function(size=c("half","whole"), theme="void") {
 	if (size != "half" & size != "whole") {
 		stop("NHL rink size must be 'half' or 'whole'")
+	}
+	
+	if (theme != "void" & theme != "bw") {
+		stop("Plot theme must be either 'void' or 'bw'")
 	}
 	
 	# Setting up colour values
@@ -13,7 +17,7 @@ plot_nhl_rink <- function(size) {
 	NHL_light_blue = "#41B6E6" # Use #41B6E6 for original crease blue in the rules, #E6F9FF for lighter hue
 	
 	# include everything for the half rink first (except the centre circle)
-	g = ggplot() + theme_void() + coord_fixed() +
+	g = ggplot() + coord_fixed() +
 		# Faceoff circles
 		geom_circle(aes(x0 = 69, y0 = 22, r = 15), colour = NHL_red, size = 2 / 12) + # Top-Right
 		geom_circle(aes(x0 = 69, y0 = -22, r = 15), colour = NHL_red, size = 2 / 12) + # Bottom-Right
@@ -49,6 +53,13 @@ plot_nhl_rink <- function(size) {
 		geom_line(aes(x = c(100, 100), y = c(-14.5, 14.5))) + # Right
 		geom_arc(aes(x0 = 72, y0 = 14.5, start = pi / 2, end = 0, r = 28)) + # Top-Right
 		geom_arc(aes(x0 = 72, y0 = -14.5, start = pi, end =  pi / 2, r = 28)) # Bottom-Right
+	
+	# add the theme here before any returns
+	if (theme == "void") {
+		g = g + theme_void()
+	} else {
+		g = g + theme_bw()
+	}
 	
 	# if we're only doing a half rink, return after adding a semicircle for the center faceoff
 	if (size == "half") {
